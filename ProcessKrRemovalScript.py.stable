@@ -1,0 +1,370 @@
+#!/usr/local/bin/python
+import Tkinter
+from Tkinter import *
+import threading
+import time
+import datetime
+import scriptstuff
+import sys
+import math
+import random
+import KrGUI
+import ThermosyphonScripts
+import ShutdownScript
+import constuff
+import flaglist
+import scipy
+
+#This class is passed to all functions and gives them all the shared information
+class AutoKrParams():
+    def __init__(self):
+        self.rindex=constuff.conclass.newcon()
+        self.windex=constuff.conclass.newcon(1)
+        self.script=None
+        self.status="Parameters Set "
+        self.GUItitle="Automated Processing"
+        self.key=constuff.readID(self.rindex)
+    
+        ### set additional parameters ###
+        #self.batchSize=[2.0,1.6]    #Not actually in use; kg of Xenon processed in a microcycle
+        self.microcycles=5
+        self.pauselength=10
+        self.TransitionTime=2*60        #Transition, sampling time
+        self.SRSBaseline=40*60  #Allow stabilization of SRS baseline 
+        self.DurXeFeed=[60,120,180,240,300]       #Xe feed duration
+        self.DurDelayedSRSAverage=15*60  #Allow stabilization of SRS baseline 
+        #self.DurChromatography=5*60  #100*60      #Chromatography duration
+        self.DurXeRecovery=4*60*60  #Xe Recovery duration
+        self.XeRefLength=120
+        self.XeRunLength=60
+        self.SC_update_time=5  # time for SRS to update
+        self.XeFeedRate=20 # MFC2 flow rate
+
+
+#the actual script part
+#including fluff bypasses a bug in threading.Thread
+def AutoKrScript(fluff,Params):
+    flaglist.flags.scriptflag.set()
+    flaglist.flags.auxflag.append([threading.Event(),threading.Event()])
+    #these lines check the status of abort flag and if it is thrown will escape
+    #from the script   
+    if not scriptstuff.sleepaware(Params,scriptstuff.empty):
+        return 0
+      
+    #confirms that the system is in the shutdown state
+    ShutdownScript.KrShutdown()
+ 
+    if not scriptstuff.sleepaware(Params,scriptstuff.empty,Params.pauselength):
+        return 0
+
+    #Open file for output
+    LogFile = open('/SVN/DAQ/SCGUI/KrRemoval/log/process_log.txt','a')
+        
+    #sets the status variable to be read by the GUI 
+    Params.status="starting up"
+    print Params.status
+
+    for x in range(Params.microcycles):
+        #He charge Phase
+        SRSverify = scriptstuff.readvalue(Params.rindex,Params.key,"SRS","XE134")
+        Params.status="SRS Xe134 reading: {0:.1f}".format(SRSverify)
+        print Params.status
+        tnaught=time.time()  # take a time reference for the duration of this microcycl
+        #Set the conditions to begin He gas flowe
+        scriptstuff.setvalue(Params.windex,Params.key,"P1",0)
+        scriptstuff.setvalue(Params.windex,Params.key,"MFC1",20,"SP1")
+        scriptstuff.setvalue(Params.windex,Params.key,"P1",10,"SP1")
+        scriptstuff.setvalue(Params.windex,Params.key,"P2",0)
+        scriptstuff.setvalue(Params.windex,Params.key,"P2",1,"NC1")
+        scriptstuff.setvalue(Params.windex,Params.key,"VD04",1)
+        scriptstuff.setvalue(Params.windex,Params.key,"VD05",0)
+        scriptstuff.setvalue(Params.windex,Params.key,"VD03",0)
+ 
+        #Check pressure condition of Charcoal column: set a flag if pressure is not low enough  
+        scriptstuff.setvalue(Params.windex,Params.key,"PT20",5)
+        p_cc_0 = scriptstuff.readvalue(Params.windex,Params.key,"PT20")
+        Params.status="Pressure at PT20: {0:3.1f}".format(p_cc_0)
+        p_cc_target = 500.0
+
+        #Begin He charging of the charcoal column, conditional based on achieving
+        #a pressure of 500 mbar in the column 
+    
+        scriptstuff.setvalue(Params.windex,Params.key,"VD06",1)
+        scriptstuff.setvalue(Params.windex,Params.key,"P1",1)
+
+        p_cc_value = scriptstuff.readvalue(Params.windex,Params.key,"PT20")
+        while p_cc_value < p_cc_target:  # might want some additional conditional tests
+            Params.status="He Charge proceeding, current pressure is {0:5.1f}".format(p_cc_value)
+            time.sleep(3)
+            p_cc_value = scriptstuff.readvalue(Params.windex,Params.key,"PT20")
+
+            if not scriptstuff.sleepaware(Params,
+                               ShutdownScript.KrShutdown,Params.pauselength):
+                return 0
+
+        
+
+        # Shutoff flow of He by closing VD06, but wait for a minute and observe pressure in column 
+        scriptstuff.setvalue(Params.windex,Params.key,"VD06",0)
+    
+        #Wait and observe pressure at PT20
+        Params.status=("Waiting while CC pressure stabilizes...")
+        i_wait = 0
+        wait_cycles = 2
+        wait_time = 15
+        p_cc_close_value = p_cc_value
+        while i_wait < wait_cycles:
+            p_cc_value = scriptstuff.readvalue(Params.windex,Params.key,"PT20")
+            p_cc_diff = p_cc_value - p_cc_close_value
+            Params.status=("Pressure is {0:.1f} & delta p is: {1:.1f} for time interval "+
+                          "{2} of {3}").format(p_cc_value,p_cc_diff,i_wait+1,wait_cycles) 
+            time.sleep(wait_time)
+            if not scriptstuff.sleepaware(Params,
+                               ShutdownScript.KrShutdown,Params.pauselength):
+                return 0
+            i_wait+=1
+
+        scriptstuff.setvalue(Params.windex,Params.key,"VD05",1)
+        scriptstuff.setvalue(Params.windex,Params.key,"MFC1",200,"SP1")
+        scriptstuff.setvalue(Params.windex,Params.key,"P1",60,"SP1")
+        time.sleep(Params.pauselength)
+        scriptstuff.setvalue(Params.windex,Params.key,"VD03",1)
+        time.sleep(Params.pauselength)
+        scriptstuff.setvalue(Params.windex,Params.key,"P2",1)
+
+    #Check that filling ends with PT20 reading greater than 500 mbar
+        p_cc_value = scriptstuff.readvalue(Params.windex,Params.key,"PT20")
+        t_he_charge_end = time.time() - tnaught
+        Params.status=("He Charge complete, final value {0:.1f} " +
+                         "and duration {1} sec ").format(p_cc_value,t_he_charge_end)
+
+    
+        if not scriptstuff.sleepaware(Params,
+                               ShutdownScript.KrShutdown,Params.pauselength,time.time()):
+            return 0
+    
+#Wait for pressure through the Chromatography loop to stabilize, primarily for
+#the SRS baseline to stabilize before initiating Xe feed
+
+
+        #sets the status variable to be read by the GUI 
+        Params.status=("Begin SRS Baseline check ") 
+        print Params.status
+
+        ## Need to establish the SRS baseline for triggering Xe recovery
+        ## Here we begin sampling the baseline while He flows through the Kr trap loop
+        ## after P1 and P2 are set on, allowing SRS baseline to settle.
+        Xe_cntr = 0
+        XeRefAvg = []
+        XeRunAvg = []
+            
+        tstop = time.time() + Params.SRSBaseline
+        while time.time() < tstop: 
+
+            #  Begin filling lists of Xe values (Reference and Running) 
+            while Xe_cntr < Params.XeRefLength:
+    
+                XeRefAvg.append(scriptstuff.readvalue(Params.rindex,Params.key,"SRS","XE134"))
+                if Xe_cntr < Params.XeRunLength:
+                    XeRunAvg.append(scriptstuff.readvalue(Params.rindex,Params.key,"SRS","XE134"))
+                else:
+                    for i in range(len(XeRunAvg)-1):
+                        XeRunAvg[i] = XeRunAvg[i+1]
+                    Params.status = "Checking on XeRunAvg: {0}".format(XeRunAvg[i])
+                    XeRunAvg[-1] = scriptstuff.readvalue(Params.rindex,Params.key,"SRS","XE134")
+                Xe_cntr += 1
+
+                if not scriptstuff.sleepaware(Params,  #Xe feed duration
+                            ShutdownScript.KrShutdown,Params.SC_update_time,time.time()):
+                    return 0
+
+            #Determine the Reference running average
+            XeRef_avg = scipy.mean(XeRefAvg)
+            XeRef_std = scipy.std(XeRefAvg)
+            Params.status=("Xe Ref running average {0:.1f} " +  
+                               "with std. dev. {1:.1f} ").format(XeRef_avg,XeRef_std)
+            for i in range(len(XeRefAvg)-1):
+                XeRefAvg[i] = XeRefAvg[i+1]
+
+            XeRefAvg[-1] = scriptstuff.readvalue(Params.rindex,Params.key,"SRS","XE134")
+            if not scriptstuff.sleepaware(Params,   #Pause for next SC update of SRS
+                    ShutdownScript.KrShutdown,Params.SC_update_time,time.time()):      
+                return 0
+        
+
+        Params.status="Baseline: {0:.1f} +/- {1:.1f}; begin Xe feed ".format(XeRef_avg,XeRef_std)
+        print Params.status
+
+    #Begin Xe feed
+        time.sleep(Params.TransitionTime)
+        scriptstuff.setvalue(Params.windex,Params.key,"VD09",1) #Xe feed begins
+        scriptstuff.setvalue(Params.windex,Params.key,"MFC2",Params.XeFeedRate)
+        Params.status="Xe feed microcycle {0}/{1}".format(x+1,Params.microcycles)
+        #Output time of begin Xe feed to log file
+        now=datetime.datetime.now()
+        logstring = "Xe feed begins: {0}\n".format(now)
+        LogFile.write(logstring)
+  
+        ## Monitor Xe baseline while feed is underway (right now, just because we can)
+        XefeedStop = time.time() + Params.DurXeFeed[x] #Set tnaought
+        while time.time() < XefeedStop:
+
+            #Update Reference average list
+            for i in range(len(XeRefAvg)-1):
+                XeRefAvg[i] = XeRefAvg[i+1]
+            XeRefAvg[-1] = scriptstuff.readvalue(Params.rindex,Params.key,"SRS","XE134")
+            XeRef_avg = scipy.mean(XeRefAvg)
+            XeRef_std = scipy.std(XeRefAvg)
+            Params.status="Xe reference average {0:.1f} with std. dev. {1:.1f}".format(XeRef_avg,XeRef_std)
+
+            #Update Running average list
+            for i in range(len(XeRunAvg)-1):
+                XeRunAvg[i] = XeRunAvg[i+1]
+            XeRunAvg[-1] = scriptstuff.readvalue(Params.rindex,Params.key,"SRS","XE134")
+            XeRun_avg = scipy.mean(XeRunAvg)
+            XeRun_std = scipy.std(XeRunAvg)
+            Params.status="Xe running average {0:.1f} with std. dev. {1:.1f}".format(XeRun_avg,XeRun_std)
+
+            if not scriptstuff.sleepaware(Params,   #Pause for next SC update of SRS
+                    ShutdownScript.KrShutdown,Params.SC_update_time,time.time()):      
+                return 0
+
+
+        scriptstuff.setvalue(Params.windex,Params.key,"MFC2",0) #Close MFC2
+        scriptstuff.setvalue(Params.windex,Params.key,"VD09",0) #Xe feed stops
+
+#####  Xe feed stops -- Chromatography period begins
+#####   -- Take ten minute Xe134 baseline, then initiate recovery when 5 min running avg exceeds
+#####  reference average by 3 std 
+
+        Params.status="Chromatography of microcycle "+str(x+1)+"/"+str(Params.microcycles)    
+   
+        justwaituntil = time.time() + Params.DurDelayedSRSAverage
+        while time.time() < justwaituntil:
+
+            #Update Reference average list
+            for i in range(len(XeRefAvg)-1):
+                XeRefAvg[i] = XeRefAvg[i+1]
+            XeRefAvg[-1] = scriptstuff.readvalue(Params.rindex,Params.key,"SRS","XE134")
+            XeRef_avg = scipy.mean(XeRefAvg)
+            XeRef_std = scipy.std(XeRefAvg)
+            Params.status="Xe reference average {0:.1f} with std. dev. {1:.1f}".format(XeRef_avg,XeRef_std)
+
+            #Update Running average list
+            for i in range(len(XeRunAvg)-1):
+                XeRunAvg[i] = XeRunAvg[i+1]
+            XeRunAvg[-1] = scriptstuff.readvalue(Params.rindex,Params.key,"SRS","XE134")
+            XeRun_avg = scipy.mean(XeRunAvg)
+            XeRun_std = scipy.std(XeRunAvg)
+            Params.status="Xe running average {0:.1f} with std. dev. {1:.1f}".format(XeRun_avg,XeRun_std)
+
+            if not scriptstuff.sleepaware(Params,   #Pause for next SC update of SRS
+                    ShutdownScript.KrShutdown,Params.SC_update_time,time.time()):      
+                return 0
+
+        Params.status=("Kr/Xe chromatography in progress... ")
+        t0 = time.time()
+        Xe_target = XeRef_avg + 3.0*XeRef_std
+        while XeRun_avg < Xe_target:  # loop to test the running average against recovery target
+            for i in range(len(XeRunAvg)-1):
+                XeRunAvg[i] = XeRunAvg[i+1]
+            XeRunAvg[-1] = scriptstuff.readvalue(Params.rindex,Params.key,"SRS","XE134")
+            XeRun_avg = scipy.mean(XeRunAvg)
+            XeRun_stdev = scipy.std(XeRunAvg)
+            Params.status="Xe running average {0:.1f} with std. dev. {1:.1f}".format(XeRun_avg,XeRun_std)
+            if not scriptstuff.sleepaware(Params,
+                               ShutdownScript.KrShutdown,Params.SC_update_time,time.time()):
+                return 0
+
+        Params.status=("Xe above recovery target, end chromatography " + str(XeRun_avg))
+        #Output begin of Xe recovery to log file
+        now=datetime.datetime.now()
+        logstring = "Xe recovery of {0} feed begins: {1}\n".format(Params.DurXeFeed[x],now)
+        LogFile.write(logstring)
+      
+
+        scriptstuff.setvalue(Params.windex,Params.key,"P2",0)           #Turn off P2
+        scriptstuff.setvalue(Params.windex,Params.key,"P1",0)           #Turn off P1
+        scriptstuff.setvalue(Params.windex,Params.key,"P1",10,"SP1")    #Set P1 to 10Hz
+        scriptstuff.setvalue(Params.windex,Params.key,"P2",0,"NC1")     #Set p2 to 80Hz
+        scriptstuff.setvalue(Params.windex,Params.key,"VD04",0)         #Open Condenser inlet
+        scriptstuff.setvalue(Params.windex,Params.key,"VD05",0)         #Close KrTrap outlet
+        scriptstuff.setvalue(Params.windex,Params.key,"VD06",1)         #Open Condenser outlet
+        scriptstuff.setvalue(Params.windex,Params.key,"VD03",0)         #Close Condenser outlet
+        scriptstuff.setvalue(Params.windex,Params.key,"MFC1",12,"SP1")  #Set He Flow for XeRecovery
+
+        Params.status="Transition to XeRecovery of microcycle "+str(x+1)+"/"+str(Params.microcycles) 
+ 
+        time.sleep(Params.TransitionTime)
+        scriptstuff.setvalue(Params.windex,Params.key,"P2",1)           #Turn on P2      
+        Params.status="Evacuating C.C. of microcycle "+str(x+1)+"/"+str(Params.microcycles)     
+
+        time.sleep(Params.TransitionTime)
+        scriptstuff.setvalue(Params.windex,Params.key,"P3",1)           #Turn on P3
+        scriptstuff.setvalue(Params.windex,Params.key,"P1",1)           #Turn on P1
+        Params.status="XeRecovery of microcycle "+str(x+1)+"/"+str(Params.microcycles)
+    
+        time.sleep(Params.TransitionTime)
+        scriptstuff.setvalue(Params.windex,Params.key,"VD07",1)         #Open Sample valve      
+        time.sleep(Params.TransitionTime)
+        scriptstuff.setvalue(Params.windex,Params.key,"VD07",0)         #Close Sample valve
+    
+        if not scriptstuff.sleepaware(Params,ShutdownScript.KrShutdown,Params.DurXeRecovery,time.time()):
+            return 0
+    
+        scriptstuff.setvalue(Params.windex,Params.key,"P3",0)           #Turn off P3
+        scriptstuff.setvalue(Params.windex,Params.key,"P1",0)           #Turn off P1
+        scriptstuff.setvalue(Params.windex,Params.key,"VD06",0)         #Close condenser outlet    
+        time.sleep(Params.pauselength)
+        scriptstuff.setvalue(Params.windex,Params.key,"P2",0)           #Turn off P2                                 
+        time.sleep(Params.pauselength)
+        scriptstuff.setvalue(Params.windex,Params.key,"VD04",1)         #Close condenser inlet    
+        time.sleep(Params.pauselength)
+
+        supply_pressure=scriptstuff.readvalue(Params.windex,Params.key,"PT14") 
+        if supply_pressure < 10:
+            break      
+    
+    LogFile.close() 
+    flaglist.flags.scriptflag.clear()    
+    
+#intializes the parameter class, the script and the gui
+#fluffstring bypasses a bug in threading.Thread (its passed but not used)
+def RunAutoKr():
+    
+    if flaglist.flags.scriptflag.is_set():
+        print "script running, wait until it ends or abort to run a new one"
+        return 0
+    
+    if flaglist.flags.readonlyflag.is_set():
+        print ("You are in read-only mode, log in as a read/write user,"
+                " or boot the current user from the main navigation window")
+        return 0
+        
+        
+    P=AutoKrParams()
+    P.script=threading.Thread(target=AutoKrScript,args=("fluff",P))
+    P.script.daemon=True
+    P.script.start()
+    scriptstuff.ScriptGUI(P)
+
+
+def RunTestXeTrig():
+    
+    if flaglist.flags.scriptflag.is_set():
+        print "script running, wait until it ends or abort to run a new one"
+        return 0
+    
+    if flaglist.flags.readonlyflag.is_set():
+        print ("You are in read-only mode, log in as a read/write user,"
+                " or boot the current user from the main navigation window")
+        return 0
+        
+        
+    P=AutoKrParams()
+    P.script=threading.Thread(target=TestXeTrigScript,args=("fluff",P))
+    P.script.daemon=True
+    P.script.start()
+    scriptstuff.ScriptGUI(P)
+
+
